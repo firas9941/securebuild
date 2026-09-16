@@ -158,12 +158,13 @@ const (
 )
 
 type queueProcessor struct {
-	channel     string
-	handler     NotificationHandler
-	workerPool  chan struct{}
-	processing  atomic.Bool
-	maxWorkers  int
-	maxDuration time.Duration // Maximum time a task can be processing before considered failed
+	channel         string
+	handler         NotificationHandler
+	workerPool      chan struct{}
+	workerAvailable chan struct{}
+	processing      atomic.Bool
+	maxWorkers      int
+	maxDuration     time.Duration // Maximum time a task can be processing before considered failed
 }
 
 // NewListener creates a new Listener instance
@@ -183,11 +184,12 @@ func (l *Listener) AddHandler(ctx context.Context, channel string, maxWorkers in
 
 	// Initialize queue processor
 	l.processors[channel] = &queueProcessor{
-		channel:     channel,
-		handler:     handler,
-		workerPool:  make(chan struct{}, maxWorkers),
-		maxWorkers:  maxWorkers,
-		maxDuration: maxDuration,
+		channel:         channel,
+		handler:         handler,
+		workerPool:      make(chan struct{}, maxWorkers),
+		workerAvailable: make(chan struct{}, 1),
+		maxWorkers:      maxWorkers,
+		maxDuration:     maxDuration,
 	}
 
 	return nil
@@ -369,6 +371,11 @@ type queueMessage struct {
 // caller should retry. Fatal query errors are logged here and surfaced as an
 // empty result so the caller stops polling until the next notification.
 func (l *Listener) fetchAndLockMessages(ctx context.Context, processor *queueProcessor) ([]queueMessage, error) {
+	// Leave work eligible for reprioritization until a handler can actually run it.
+	availableWorkers := processor.maxWorkers - len(processor.workerPool)
+	if availableWorkers <= 0 {
+		return nil, nil
+	}
 	poolConn, err := persistence.GetPooledPostgresSessionWithTimeout(ctx, 10*time.Second)
 	if err != nil {
 		return nil, err
@@ -409,13 +416,20 @@ func (l *Listener) fetchAndLockMessages(ctx context.Context, processor *queuePro
 	channelTag := fmt.Sprintf("channel:%s", processor.channel)
 	telemetry.Gauge("securebuild.worker.queue.total", float64(total), []string{channelTag})
 
-	// Query and lock unprocessed messages atomically
-	// Order by priority DESC (higher priority first), then created_at ASC (oldest first)
-	// Priority: 0/NULL = normal, 1 = high
+	cte := buildOrderCTE(processor.channel)
+	order := "COALESCE(pending.priority, 0) DESC, queue_rank, pending.created_at, pending.id"
+	join := ""
+	rank := "0::bigint"
+	if cte != "" {
+		join = "JOIN build_order ON build_order.id = pending.id"
+		rank = "build_order.version_rank"
+	}
+	// Claim atomically, then explicitly order the returned batch: UPDATE RETURNING
+	// alone does not preserve the order used to select rows.
 	rows, err := poolConn.Query(ctx, fmt.Sprintf(`
-		WITH next_available_messages AS (
-			SELECT id, payload
-			FROM %s
+		WITH %s next_available_messages AS (
+			SELECT pending.id, pending.payload, %s AS queue_rank
+			FROM %s AS pending %s
 			WHERE completed_at IS NULL
 			AND channel = $1
 			AND COALESCE(next_attempt_at, created_at) <= NOW()
@@ -423,10 +437,10 @@ func (l *Listener) fetchAndLockMessages(ctx context.Context, processor *queuePro
 				processing_started_at IS NULL
 				OR processing_started_at < NOW() - $2::interval
 			)
-			ORDER BY COALESCE(priority, 0) DESC, created_at ASC
+			ORDER BY %s
 			LIMIT %d
-			FOR UPDATE SKIP LOCKED
-		)
+			FOR UPDATE OF pending SKIP LOCKED
+		), claimed AS (
 		UPDATE %s AS wq
 		SET processing_started_at = NOW(),
 			attempt_count = COALESCE(attempt_count, 0) + CASE
@@ -435,9 +449,12 @@ func (l *Listener) fetchAndLockMessages(ctx context.Context, processor *queuePro
 			END
 		FROM next_available_messages
 		WHERE wq.id = next_available_messages.id
-		RETURNING wq.id, wq.payload, COALESCE(wq.attempt_count, 0)::int, wq.created_at`,
-		WorkQueueTable, processor.maxWorkers, WorkQueueTable),
-		processor.channel, processor.maxDuration.String())
+		RETURNING wq.id, wq.payload, COALESCE(wq.attempt_count, 0)::int AS attempt_count,
+			wq.priority, wq.created_at, next_available_messages.queue_rank
+		)
+		SELECT id, payload, attempt_count, created_at FROM claimed
+		ORDER BY COALESCE(priority, 0) DESC, queue_rank, created_at, id`,
+		cte, rank, WorkQueueTable, join, order, availableWorkers, WorkQueueTable), processor.channel, processor.maxDuration.String())
 	if err != nil {
 		logger.Error(fmt.Errorf("failed to query messages: %w", err))
 		return nil, nil
@@ -459,9 +476,20 @@ func (l *Listener) fetchAndLockMessages(ctx context.Context, processor *queuePro
 
 // processMessagesForQueue handles a single iteration of message processing
 func (l *Listener) processMessagesForQueue(ctx context.Context, processor *queueProcessor) bool {
-	messages, err := l.fetchAndLockMessages(ctx, processor)
+	if !processor.waitForCapacity(ctx) {
+		return false
+	}
+	// Measure ranking and dispatch separately from time spent waiting for a worker.
+	span, claimCtx := telemetry.StartSpan(ctx, "listener.process_messages_for_queue")
+	defer span.Finish()
+	span.SetTag("queue.channel", processor.channel)
+	span.SetTag("queue.available_workers", processor.maxWorkers-len(processor.workerPool))
+	messages, err := l.fetchAndLockMessages(claimCtx, processor)
+	span.SetTag("queue.claimed_messages", len(messages))
 	if err != nil {
-		logger.Warn("failed to get pooled connection in time for listener, continuing with next iteration", zap.String("channel", processor.channel), zap.Error(err))
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+		logger.Warn("failed to fetch queue messages, continuing with next iteration", zap.String("channel", processor.channel), zap.Error(err))
 		return true
 	}
 
@@ -504,7 +532,7 @@ func (l *Listener) processMessagesForQueue(ctx context.Context, processor *queue
 		processor.workerPool <- struct{}{}
 
 		go func(messageID string, messagePayload []byte, attemptCount int, messageCreatedAt time.Time) {
-			defer func() { <-processor.workerPool }()
+			defer processor.releaseWorkerSlot()
 
 			startTime := time.Now()
 			// attempt_count from DB is 0-based; use 1-based for context so GetAttemptInfo matches tests and logs
