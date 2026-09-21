@@ -164,5 +164,10 @@ seedData:
         - column: scan_status_updated_at
           value:
             str: "2024-01-01T00:02:00Z"
+        # Simulates a legacy failed refresh that incorrectly advanced the
+        # completion timestamp past the last successful SBOM scan.
+        - column: scan_completed_at
+          value:
+            str: "2099-01-01T00:05:00Z"
     # Note: pending_sbom and generating_sbom statuses have been moved to a separate
     # SBOM status table (external_image_sbom_status) and are no longer part of scan status

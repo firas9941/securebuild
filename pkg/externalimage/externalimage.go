@@ -309,7 +309,8 @@ func InitializeScanStatusQueued(ctx context.Context, digest, arch string) error 
 }
 
 // SetExternalImageScanStatus records a scan result (success or failure).
-// Sets scan_completed_at to the current time. For new rows, also sets scan_attempted_at.
+// scan_completed_at tracks the last successfully persisted result, so status-only
+// updates preserve it. For new rows, scan_attempted_at is also set.
 // On conflict, scan_attempted_at is not updated (it should have been set by SetScanStatusRunning).
 func SetExternalImageScanStatus(ctx context.Context, params SetExternalImageScanStatusParams) error {
 	conn := persistence.MustGetPooledPostgresSession(ctx)
@@ -343,7 +344,9 @@ func SetExternalImageScanStatus(ctx context.Context, params SetExternalImageScan
 	// Step 2: Write metadata to DB. Blob content lives only in object storage.
 	query := `
 		INSERT INTO external_image_scan (digest, arch, parsed_results, created_at, status, scan_status_message, updated_at, scan_completed_at, scan_attempted_at, scan_status_updated_at, is_in_object_store)
-		VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $4, $4, $4, $4, $7)
+		VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $4,
+		        CASE WHEN $5::text = 'succeeded' THEN $4::timestamptz ELSE NULL::timestamptz END,
+		        $4, $4, $7)
 		ON CONFLICT (digest, arch) DO UPDATE
 		SET parsed_results = CASE
 		        WHEN EXCLUDED.status = 'succeeded' AND NULLIF(EXCLUDED.parsed_results, '') IS NOT NULL
@@ -353,7 +356,10 @@ func SetExternalImageScanStatus(ctx context.Context, params SetExternalImageScan
 		    status = $5,
 		    scan_status_message = $6,
 		    updated_at = $4,
-		    scan_completed_at = $4,
+		    scan_completed_at = CASE
+		        WHEN EXCLUDED.status = 'succeeded' THEN EXCLUDED.scan_completed_at
+		        ELSE external_image_scan.scan_completed_at
+		    END,
 		    scan_status_updated_at = $4,
 		    is_in_object_store = external_image_scan.is_in_object_store OR EXCLUDED.is_in_object_store
 	`

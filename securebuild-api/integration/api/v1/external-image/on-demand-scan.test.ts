@@ -3,6 +3,7 @@ import { Client } from 'pg';
 import { setupTestEnvironment, TestEnvironment } from '../../../fixtures/environment';
 
 const DIGEST_WITH_STALE_SCAN = 'sha256:stale1234567890123456789012345678901234567890123456789012345';
+const DIGEST_WITH_FAILED_REFRESH = 'sha256:failed123456789012345678901234567890123456789012345678901234';
 
 /**
  * Integration tests for the on-demand scan trigger (Part 3).
@@ -167,6 +168,23 @@ describe('On-demand scan trigger', () => {
           `/api/v1/external-image/scan?digest=${encodeURIComponent(digest())}&arch=amd64&format=parsed`,
         );
         expect(res.status).toBe(200);
+      });
+    });
+  });
+
+  describe('Failed refresh', () => {
+    it('reports the previous success time and permits an on-demand retry', async () => {
+      await expectScanNotification(DIGEST_WITH_FAILED_REFRESH, async () => {
+        const res = await env.client.get(
+          `/api/v1/external-image?sha=${encodeURIComponent(DIGEST_WITH_FAILED_REFRESH)}`,
+        );
+        expect(res.status).toBe(200);
+
+        const data = res.data as Record<string, unknown>;
+        expect(data.last_scanned_at).toBe('2024-01-01T00:05:00.000Z');
+        expect(data.scan_status).toBe('failed');
+        expect(data.scan_status_message).toBe('Failed to pull image: authentication required');
+        expect(data.scan_started_at).not.toBeNull();
       });
     });
   });

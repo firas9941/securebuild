@@ -154,6 +154,37 @@ describe('Read endpoints /scan, /scan-summary, /sbom', () => {
       }
     });
 
+    it('serves the previous scan result alongside a failed refresh', async () => {
+      await env.dbPool.query(
+        `UPDATE external_image_scan
+         SET status = 'failed',
+             scan_status_message = 'refresh failed',
+             scan_status_updated_at = now()
+         WHERE digest = $1`,
+        [digest()],
+      );
+
+      try {
+        const batchRes = await env.client.post('/api/v1/external-image/scan', {
+          digests: [digest()],
+          arch: 'amd64',
+          format: 'parsed',
+        });
+        expect(batchRes.status).toBe(200);
+        expect(batchRes.data[0].scan_status).toBe('failed');
+        expect(batchRes.data[0].scan_status_message).toBe('refresh failed');
+        expect(batchRes.data[0].result.counts.high).toBe(1);
+        expect(batchRes.data[0].result.counts.total).toBe(1);
+      } finally {
+        await env.dbPool.query(
+          `UPDATE external_image_scan
+           SET status = 'succeeded', scan_status_message = NULL
+           WHERE digest = $1`,
+          [digest()],
+        );
+      }
+    });
+
     it('GET /sbom?digest returns SPDX SBOM', async () => {
       const res = await env.client.get(`/api/v1/external-image/sbom?digest=${encodeURIComponent(digest())}`);
       expect(res.status).toBe(200);

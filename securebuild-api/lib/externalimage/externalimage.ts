@@ -413,7 +413,8 @@ export const getExternalImageScan = traceFunction('lib.externalimage.getExternal
 
     // Query metadata only — blob content is fetched from object store
     const query = `select escan.is_in_object_store, escan.created_at as scan_created_at, esbom.created_at as sbom_created_at, esbom.image_size_bytes as image_size_bytes,
-      escan.status, escan.scan_status_message, escan.scan_status_updated_at, escan.scan_attempted_at, escan.scan_completed_at, escan.updated_at, esbom.image_digest
+      escan.status, escan.scan_status_message, escan.scan_status_updated_at, escan.scan_attempted_at,
+      esbom.last_security_scanned_at as scan_completed_at, escan.updated_at, esbom.image_digest
       from external_image_scan escan
       left join external_image_sbom esbom on escan.digest = esbom.digest and escan.arch = esbom.arch
       where escan.digest = $1 and escan.arch = $2`
@@ -611,7 +612,9 @@ export async function getExternalImageLastScannedAt(digest: string): Promise<str
   try {
     const db = getDB(await getParam("DB_URI"))
 
-    const query = `select max(scan_completed_at) as last_scanned_at from external_image_scan where digest = $1`
+    // This timestamp advances only after a usable result is stored. A later
+    // failed attempt changes scan status without making the old result newer.
+    const query = `select max(last_security_scanned_at) as last_scanned_at from external_image_sbom where digest = $1`
     const result = await db.query(query, [digest])
 
     if (result.rows.length === 0 || !result.rows[0].last_scanned_at) {
@@ -901,7 +904,7 @@ export const getBatchExternalImageScans = traceFunction('lib.externalimage.getBa
           escan.digest,
           escan.is_in_object_store,
           escan.created_at as scan_created_at,
-          escan.scan_completed_at as scan_completed_at,
+          esbom.last_security_scanned_at as scan_completed_at,
           esbom.created_at as digest_first_seen_at,
           esbom.image_size_bytes,
           escan.status as scan_status,
@@ -1047,7 +1050,7 @@ export const getBatchExternalImageScanSummaries = traceFunction('lib.externalima
       requested.digest,
       escan.parsed_results,
       escan.is_in_object_store,
-      escan.scan_completed_at,
+      esbom.last_security_scanned_at AS scan_completed_at,
       esbom.created_at AS digest_first_seen_at,
       esbom.image_size_bytes,
       escan.status AS scan_status,
@@ -1341,10 +1344,13 @@ export async function EnqueueScanForDigest(digest: string): Promise<EnqueueScanR
   // Step 2 (transaction): Lock scan rows, check staleness, enqueue if needed.
   return withTransaction(db, async (client) => {
     const lockQuery = `
-      SELECT digest, arch, status, scan_completed_at, scan_attempted_at
-      FROM external_image_scan
-      WHERE digest = $1
-      FOR UPDATE
+      SELECT escan.digest, escan.arch, escan.status, escan.scan_attempted_at,
+             esbom.last_security_scanned_at
+      FROM external_image_scan escan
+      INNER JOIN external_image_sbom esbom
+        ON esbom.digest = escan.digest AND esbom.arch = escan.arch
+      WHERE escan.digest = $1
+      FOR UPDATE OF escan
     `
     const lockResult = await client.query(lockQuery, [digest])
 
@@ -1356,13 +1362,13 @@ export async function EnqueueScanForDigest(digest: string): Promise<EnqueueScanR
 
     for (const row of lockResult.rows) {
       const status = row.status
-      const scanCompletedAt = row.scan_completed_at
+      const lastSecurityScannedAt = row.last_security_scanned_at
 
       if (status === 'queued' || status === 'running') {
         hasInProgress = true
       }
 
-      if (status === 'unknown' || !scanCompletedAt || new Date(scanCompletedAt) < fourHoursAgo) {
+      if (status === 'unknown' || !lastSecurityScannedAt || new Date(lastSecurityScannedAt) < fourHoursAgo) {
         allRecent = false
       }
 

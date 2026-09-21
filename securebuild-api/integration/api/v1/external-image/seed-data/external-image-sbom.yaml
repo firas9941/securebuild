@@ -20,6 +20,9 @@ seedData:
         - column: image_size_bytes
           value:
             str: "1024000"
+        - column: last_security_scanned_at
+          value:
+            str: "2099-01-01T00:05:00Z"
         - column: is_in_object_store
           value:
             str: "true"
@@ -39,6 +42,9 @@ seedData:
         - column: image_size_bytes
           value:
             str: "1024000"
+        - column: last_security_scanned_at
+          value:
+            str: "2099-01-01T00:05:00Z"
         - column: is_in_object_store
           value:
             str: "true"
@@ -59,6 +65,9 @@ seedData:
         - column: image_size_bytes
           value:
             int: 1024000
+        - column: last_security_scanned_at
+          value:
+            str: "2024-01-01T00:05:00Z"
         - column: is_in_object_store
           value:
             str: "true"
@@ -119,6 +128,9 @@ seedData:
         - column: image_size_bytes
           value:
             int: 1024000
+        - column: last_security_scanned_at
+          value:
+            str: "2024-01-01T00:05:00Z"
         - column: is_in_object_store
           value:
             str: "true"

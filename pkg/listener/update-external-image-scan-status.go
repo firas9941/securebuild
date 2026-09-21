@@ -305,11 +305,7 @@ func processCompletedScansBatch(ctx context.Context, cache *scan.ScanCapacityCac
 		if sd.Metadata.Digest == "" {
 			continue
 		}
-		scannedArchs := make([]string, 0, len(sd.ArchStatuses))
-		for arch := range sd.ArchStatuses {
-			scannedArchs = append(scannedArchs, arch)
-		}
-		if err := scan.UpdateLastSecurityScanned(ctx, sd.Metadata.Digest, scannedArchs, now); err != nil {
+		if err := scan.UpdateLastSecurityScanned(ctx, sd.Metadata.Digest, successByDigest[sd.Metadata.Digest], now); err != nil {
 			logger.Warn("failed to update last_security_scanned_at",
 				zap.String("digest", sd.Metadata.Digest),
 				zap.Error(err))
@@ -471,11 +467,7 @@ func processScanDir(ctx context.Context, cache *scan.ScanCapacityCache, vm build
 	}
 
 	if allDone && len(sd.ArchStatuses) > 0 {
-		scannedArchs := make([]string, 0, len(sd.ArchStatuses))
-		for arch := range sd.ArchStatuses {
-			scannedArchs = append(scannedArchs, arch)
-		}
-		if err := scan.UpdateLastSecurityScanned(ctx, digest, scannedArchs, now); err != nil {
+		if err := scan.UpdateLastSecurityScanned(ctx, digest, successArchs, now); err != nil {
 			logger.Warn("failed to update last_security_scanned_at",
 				zap.String("digest", digest),
 				zap.Error(err))

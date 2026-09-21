@@ -250,9 +250,25 @@ func SelectExternalImageDigestsToScan(ctx context.Context, maxToProcess int) ([]
 	// so that orphaned scans from crashed workers can be recovered.
 	staleThreshold := fmt.Sprintf("%d minutes", int(ScanStalenessThreshold.Minutes()))
 	rows, err := conn.Query(ctx, `
+		WITH digest_activity AS (
+			SELECT digest, MAX(last_submitted_at) AS last_submitted_at
+			FROM external_image_tag
+			GROUP BY digest
+		)
 		SELECT s.digest
 		FROM external_image_sbom s
+		LEFT JOIN digest_activity activity ON activity.digest = s.digest
 		WHERE s.last_security_scanned_at IS NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM external_image_scan sc
+		    WHERE sc.digest = s.digest
+		      AND sc.status = 'failed'
+		      AND sc.scan_status_updated_at > $2::timestamptz - CASE
+		        WHEN activity.last_submitted_at > $2::timestamptz - interval '7 days' THEN interval '4 hours'
+		        WHEN activity.last_submitted_at > $2::timestamptz - interval '30 days' THEN interval '12 hours'
+		        ELSE interval '24 hours'
+		      END
+		  )
 		  AND NOT EXISTS (
 		    SELECT 1 FROM external_image_scan sc
 		    WHERE sc.digest = s.digest
@@ -262,7 +278,7 @@ func SelectExternalImageDigestsToScan(ctx context.Context, maxToProcess int) ([]
 		GROUP BY s.digest
 		ORDER BY random()
 		LIMIT $1
-	`, maxToProcess)
+	`, maxToProcess, referenceTime)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query digests missing scans: %w", err)
 	}
@@ -305,13 +321,19 @@ func SelectExternalImageDigestsToScan(ctx context.Context, maxToProcess int) ([]
 			  AND NOT EXISTS (
 			    SELECT 1 FROM external_image_scan sc
 			    WHERE sc.digest = s.digest
+			      AND sc.status = 'failed'
+			      AND sc.scan_status_updated_at > $2::timestamptz - interval '%s'
+			  )
+			  AND NOT EXISTS (
+			    SELECT 1 FROM external_image_scan sc
+			    WHERE sc.digest = s.digest
 			      AND sc.status = 'running'
 			      AND sc.scan_status_updated_at > NOW() - interval '%s'
 			  )
 			GROUP BY s.digest
 			ORDER BY random()
 			LIMIT $1
-		`, tierTagsWhere, tier.rescanInterval, staleThreshold)
+		`, tierTagsWhere, tier.rescanInterval, tier.rescanInterval, staleThreshold)
 
 		rows, err := conn.Query(ctx, query, remaining, referenceTime)
 		if err != nil {
