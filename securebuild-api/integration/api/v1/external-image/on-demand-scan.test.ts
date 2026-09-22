@@ -1,9 +1,11 @@
 import * as path from 'path';
 import { Client } from 'pg';
 import { setupTestEnvironment, TestEnvironment } from '../../../fixtures/environment';
+import { lockExternalImageScanRowsAndReadFreshness } from '../../../../lib/externalimage/externalimage';
 
 const DIGEST_WITH_STALE_SCAN = 'sha256:stale1234567890123456789012345678901234567890123456789012345';
 const DIGEST_WITH_FAILED_REFRESH = 'sha256:failed123456789012345678901234567890123456789012345678901234';
+const DIGEST_WITH_RUNNING_SCAN = 'sha256:running123456789012345678901234567890123456789012345678901234';
 
 /**
  * Integration tests for the on-demand scan trigger (Part 3).
@@ -125,6 +127,28 @@ describe('On-demand scan trigger', () => {
     expect(notification).toBeNull();
   }
 
+  async function waitForBlockedScanLock(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      const result = await env.dbPool.query(
+        `SELECT EXISTS (
+           SELECT 1
+           FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND pid <> pg_backend_pid()
+             AND wait_event_type = 'Lock'
+             AND query LIKE '%FROM external_image_scan%'
+             AND query LIKE '%FOR UPDATE%'
+         ) AS blocked`
+      );
+      if (result.rows[0].blocked) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    return false;
+  }
+
   describe('Stale image (scan >4h old)', () => {
     const digest = () => DIGEST_WITH_STALE_SCAN;
 
@@ -186,6 +210,65 @@ describe('On-demand scan trigger', () => {
         expect(data.scan_status_message).toBe('Failed to pull image: authentication required');
         expect(data.scan_started_at).not.toBeNull();
       });
+    });
+  });
+
+  describe('Concurrent successful refresh', () => {
+    it('reads freshness after a worker holding the scan lock commits', async () => {
+      const workerClient = await env.dbPool.connect();
+      const readerClient = await env.dbPool.connect();
+      let workerTransactionOpen = false;
+      let readerTransactionOpen = false;
+      let readPromise: ReturnType<typeof lockExternalImageScanRowsAndReadFreshness> | undefined;
+
+      try {
+        await workerClient.query('BEGIN');
+        workerTransactionOpen = true;
+
+        const completedAt = new Date();
+        await workerClient.query(
+          `UPDATE external_image_scan
+           SET status = 'succeeded',
+               scan_completed_at = $3,
+               scan_status_updated_at = $3,
+               updated_at = $3
+           WHERE digest = $1 AND arch = $2`,
+          [DIGEST_WITH_RUNNING_SCAN, 'x86_64', completedAt]
+        );
+        await workerClient.query(
+          `UPDATE external_image_sbom
+           SET last_security_scanned_at = $3
+           WHERE digest = $1 AND arch = $2`,
+          [DIGEST_WITH_RUNNING_SCAN, 'x86_64', completedAt]
+        );
+
+        await readerClient.query('BEGIN');
+        readerTransactionOpen = true;
+        readPromise = lockExternalImageScanRowsAndReadFreshness(
+          readerClient,
+          DIGEST_WITH_RUNNING_SCAN,
+        );
+
+        expect(await waitForBlockedScanLock(5000)).toBe(true);
+
+        await workerClient.query('COMMIT');
+        workerTransactionOpen = false;
+
+        const rows = await readPromise;
+        expect(rows).toHaveLength(1);
+        expect(rows[0].status).toBe('succeeded');
+        expect(new Date(rows[0].last_security_scanned_at!).getTime()).toBe(completedAt.getTime());
+      } finally {
+        if (workerTransactionOpen) {
+          await workerClient.query('ROLLBACK');
+        }
+        if (readerTransactionOpen) {
+          await readerClient.query('ROLLBACK');
+        }
+        workerClient.release();
+        readerClient.release();
+        await readPromise?.catch(() => undefined);
+      }
     });
   });
 });

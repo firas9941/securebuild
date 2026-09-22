@@ -1,3 +1,4 @@
+import type { PoolClient } from 'pg';
 import { TrackedExternalImage } from '../types/externalimage';
 import { getDB, withTransaction } from '../data/db';
 import { getParam } from '../data/param';
@@ -1294,15 +1295,58 @@ export interface EnqueueScanResult {
   enqueued: boolean
 }
 
+interface LockedExternalImageScanRow {
+  digest: string
+  arch: string
+  status: string
+  scan_attempted_at: Date | null
+  last_security_scanned_at: Date | null
+}
+
+/**
+ * Lock scan rows before reading SBOM freshness. These must be separate
+ * statements so the freshness read gets a new READ COMMITTED snapshot after
+ * any worker transaction that held a scan-row lock has committed.
+ */
+export async function lockExternalImageScanRowsAndReadFreshness(
+  client: PoolClient,
+  digest: string,
+): Promise<LockedExternalImageScanRow[]> {
+  const scanResult = await client.query(
+    `SELECT digest, arch, status, scan_attempted_at
+     FROM external_image_scan
+     WHERE digest = $1
+     ORDER BY arch
+     FOR UPDATE`,
+    [digest]
+  )
+
+  const freshnessResult = await client.query(
+    `SELECT arch, last_security_scanned_at
+     FROM external_image_sbom
+     WHERE digest = $1`,
+    [digest]
+  )
+  const freshnessByArch = new Map(
+    freshnessResult.rows.map((row) => [row.arch, row.last_security_scanned_at])
+  )
+
+  return scanResult.rows.map((row) => ({
+    ...row,
+    last_security_scanned_at: freshnessByArch.get(row.arch) ?? null,
+  }))
+}
+
 /**
  * EnqueueScanForDigest triggers an on-demand scan for a digest if the existing
  * scan results are stale (older than 4 hours) or missing. Uses a transaction
- * with row locking (SELECT ... FOR UPDATE) on external_image_sbom and
- * external_image_scan to ensure atomicity and prevent duplicate enqueues.
+ * with row locking (SELECT ... FOR UPDATE) on external_image_scan to ensure
+ * atomicity and prevent duplicate enqueues.
  *
  * Steps (all inside one transaction):
- *  1. LEFT JOIN external_image_sbom to external_image_scan with FOR UPDATE
- *     — locks SBOM rows (must exist for a scan) and scan rows if they exist.
+ *  1. Lock scan rows before reading SBOM freshness. The freshness read uses a
+ *     separate statement so it gets a new READ COMMITTED snapshot after any
+ *     worker transaction that held a scan-row lock has committed.
  *  2. Staleness check: if any arch is queued/running, or all arches were
  *     scanned within 4 hours, skip enqueue and return existing scan_attempted_at.
  *  3. If stale/missing: insert into work_queue + pg_notify, then upsert
@@ -1343,16 +1387,7 @@ export async function EnqueueScanForDigest(digest: string): Promise<EnqueueScanR
 
   // Step 2 (transaction): Lock scan rows, check staleness, enqueue if needed.
   return withTransaction(db, async (client) => {
-    const lockQuery = `
-      SELECT escan.digest, escan.arch, escan.status, escan.scan_attempted_at,
-             esbom.last_security_scanned_at
-      FROM external_image_scan escan
-      INNER JOIN external_image_sbom esbom
-        ON esbom.digest = escan.digest AND esbom.arch = escan.arch
-      WHERE escan.digest = $1
-      FOR UPDATE OF escan
-    `
-    const lockResult = await client.query(lockQuery, [digest])
+    const scanRows = await lockExternalImageScanRowsAndReadFreshness(client, digest)
 
     // Step 3: Staleness check
     let hasInProgress = false
@@ -1360,7 +1395,7 @@ export async function EnqueueScanForDigest(digest: string): Promise<EnqueueScanR
     let existingScanAttemptedAt: Date | null = null
     const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000)
 
-    for (const row of lockResult.rows) {
+    for (const row of scanRows) {
       const status = row.status
       const lastSecurityScannedAt = row.last_security_scanned_at
 
@@ -1380,7 +1415,7 @@ export async function EnqueueScanForDigest(digest: string): Promise<EnqueueScanR
       }
     }
 
-    if (hasInProgress || (allRecent && lockResult.rows.length > 0)) {
+    if (hasInProgress || (allRecent && scanRows.length > 0)) {
       return { scanStartedAt: existingScanAttemptedAt, enqueued: false }
     }
 
@@ -1389,7 +1424,7 @@ export async function EnqueueScanForDigest(digest: string): Promise<EnqueueScanR
 
     await enqueueWork('external_image_scan', { digest }, client)
 
-    for (const row of lockResult.rows) {
+    for (const row of scanRows) {
       await client.query(
         `UPDATE external_image_scan
          SET status = 'queued',
