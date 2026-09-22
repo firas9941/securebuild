@@ -142,6 +142,10 @@ func TestExternalImageScanStatusTransitions(t *testing.T) {
 		successfulScanCompletedAt := *scanStatus.ScanCompletedAt
 		assert.NotEmpty(t, scanStatus.ParsedResults, "Parsed results should be set")
 		storedParsedResults := *scanStatus.ParsedResults
+		successfulFreshness := getSBOMLastSecurityScannedAt(t, ctx, testDigest)
+		require.NotNil(t, successfulFreshness["x86_64"])
+		assert.Equal(t, successfulScanCompletedAt, *successfulFreshness["x86_64"],
+			"Result metadata and successful freshness should publish with the same timestamp")
 
 		// A later status-only update must preserve the last successful counts.
 		err = externalimage.SetExternalImageScanStatus(ctx, externalimage.SetExternalImageScanStatusParams{
@@ -176,6 +180,28 @@ func TestExternalImageScanStatusTransitions(t *testing.T) {
 		sbomStatuses = getSBOMStatuses(t, ctx, testDigest)
 		require.Len(t, sbomStatuses, 1)
 		assert.Equal(t, "succeeded", sbomStatuses[0].Status)
+	})
+
+	t.Run("Successful metadata rolls back when freshness cannot be published", func(t *testing.T) {
+		missingSBOMDigest := "sha256:test-missing-sbom-1234567890123456789012345678901234"
+		err := externalimage.SetExternalImageScanStatus(ctx, externalimage.SetExternalImageScanStatusParams{
+			Digest:               missingSBOMDigest,
+			Arch:                 "x86_64",
+			Status:               externalimage.ScanStatusSucceeded,
+			ParsedResults:        `{"total":0}`,
+			ParsedResultsDetails: `{"counts":{"total":0}}`,
+			RawResult:            `{"matches":[]}`,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected 1 SBOM row")
+
+		conn := persistence.MustGetPooledPostgresSession(ctx)
+		defer conn.Release()
+		var count int
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT COUNT(*) FROM external_image_scan WHERE digest = $1`,
+			missingSBOMDigest).Scan(&count))
+		assert.Zero(t, count, "scan metadata should roll back with the failed freshness update")
 	})
 }
 

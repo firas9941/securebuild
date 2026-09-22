@@ -248,7 +248,6 @@ func processCompletedScansBatch(ctx context.Context, cache *scan.ScanCapacityCac
 	}
 
 	// Process results locally from the extracted tar.
-	now := time.Now().UTC()
 	var dirsToCleanup []string
 	successByDigest := make(map[string][]string)
 
@@ -304,11 +303,6 @@ func processCompletedScansBatch(ctx context.Context, cache *scan.ScanCapacityCac
 	for _, sd := range completedDirs {
 		if sd.Metadata.Digest == "" {
 			continue
-		}
-		if err := scan.UpdateLastSecurityScanned(ctx, sd.Metadata.Digest, successByDigest[sd.Metadata.Digest], now); err != nil {
-			logger.Warn("failed to update last_security_scanned_at",
-				zap.String("digest", sd.Metadata.Digest),
-				zap.Error(err))
 		}
 		cache.RemoveScan(vm.ID, sd.Metadata.Digest)
 		dirsToCleanup = append(dirsToCleanup, sd.WorkDir)
@@ -467,12 +461,6 @@ func processScanDir(ctx context.Context, cache *scan.ScanCapacityCache, vm build
 	}
 
 	if allDone && len(sd.ArchStatuses) > 0 {
-		if err := scan.UpdateLastSecurityScanned(ctx, digest, successArchs, now); err != nil {
-			logger.Warn("failed to update last_security_scanned_at",
-				zap.String("digest", digest),
-				zap.Error(err))
-		}
-
 		cleanupScanDir(ctx, runner, sd.WorkDir)
 		cache.RemoveScan(vm.ID, digest)
 

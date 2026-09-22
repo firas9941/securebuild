@@ -358,23 +358,6 @@ func SelectExternalImageDigestsToScan(ctx context.Context, maxToProcess int) ([]
 	return selectedDigests, nil
 }
 
-// UpdateLastSecurityScanned updates the last_security_scanned_at timestamp
-// for the specified architectures of a digest. If archs is empty, no update
-// is performed.
-func UpdateLastSecurityScanned(ctx context.Context, digest string, archs []string, t time.Time) error {
-	if len(archs) == 0 {
-		return nil
-	}
-
-	conn := persistence.MustGetPooledPostgresSession(ctx)
-	defer conn.Release()
-
-	if _, err := conn.Exec(ctx, `UPDATE external_image_sbom SET last_security_scanned_at = $3 WHERE digest = $1 AND arch = ANY($2)`, digest, archs, t); err != nil {
-		return err
-	}
-	return nil
-}
-
 // processExternalImageScans selects external image SBOMs to scan and enqueues
 // them as external_image_scan work items for builder-based dispatch.
 // Selection uses tiered back-off based on last_submitted_at (see SelectExternalImageDigestsToScan).
