@@ -424,12 +424,6 @@ func runScanForDigestInProcess(ctx context.Context, digest string, attempt, maxA
 		telemetry.Increment(telemetry.MetricExternalImageScanSucceeded, []string{telemetry.TagChannelExternalImageScan})
 	}
 
-	if err := scan.UpdateLastSecurityScanned(ctx, digest, successArchs, time.Now().UTC()); err != nil {
-		logger.Warn("failed to update last_security_scanned_at",
-			zap.String("digest", digest),
-			zap.Error(err))
-	}
-
 	return nil
 }
 

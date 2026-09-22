@@ -151,6 +151,49 @@ func TestSelectExternalImageDigestsToScanFreshNotStale(t *testing.T) {
 	assert.NotContains(t, digests, freshDigest, "recently scanned digest within interval should not be selected")
 }
 
+// TestSelectExternalImageDigestsToScanFailureBackoff verifies that failures do
+// not make a result fresh while still preserving the active tier's four-hour
+// automatic attempt cadence.
+func TestSelectExternalImageDigestsToScanFailureBackoff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+	t.Parallel()
+
+	ctx, cleanup := setupTierTestDB(t)
+	defer cleanup()
+
+	refTime, err := time.Parse(time.RFC3339, referenceTime)
+	require.NoError(t, err)
+
+	conn := persistence.MustGetPooledPostgresSession(ctx)
+	defer conn.Release()
+
+	_, err = conn.Exec(ctx, `
+		INSERT INTO external_image_scan
+		  (digest, arch, created_at, status, scan_status_message, scan_status_updated_at)
+		VALUES ($1, 'x86_64', $2, 'failed', 'scan failed', $2)
+	`, neverScannedDg, refTime.Add(-time.Hour))
+	require.NoError(t, err)
+
+	digests, err := scan.SelectExternalImageDigestsToScan(ctx, 25)
+	require.NoError(t, err)
+	assert.NotContains(t, digests, neverScannedDg,
+		"a recent failed attempt should observe the active tier retry interval")
+
+	_, err = conn.Exec(ctx, `
+		UPDATE external_image_scan
+		SET scan_status_updated_at = $2
+		WHERE digest = $1
+	`, neverScannedDg, refTime.Add(-5*time.Hour))
+	require.NoError(t, err)
+
+	digests, err = scan.SelectExternalImageDigestsToScan(ctx, 25)
+	require.NoError(t, err)
+	assert.Contains(t, digests, neverScannedDg,
+		"the failed scan should be retried after the active tier interval")
+}
+
 // TestHandleExternalImageScanIdempotency verifies that a scan message arriving
 // after a scan already completed within 4 hours is discarded without re-scanning.
 // Uses the "fresh" digest from seed data, which has last_security_scanned_at

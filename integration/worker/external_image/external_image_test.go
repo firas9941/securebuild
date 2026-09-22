@@ -138,9 +138,14 @@ func TestExternalImageScanStatusTransitions(t *testing.T) {
 		require.Len(t, scanStatuses, 1)
 		scanStatus := scanStatuses[0]
 		assert.Equal(t, "succeeded", scanStatus.Status)
-		assert.NotNil(t, scanStatus.ScanCompletedAt, "Scan completed timestamp should be set")
+		require.NotNil(t, scanStatus.ScanCompletedAt, "Scan completed timestamp should be set")
+		successfulScanCompletedAt := *scanStatus.ScanCompletedAt
 		assert.NotEmpty(t, scanStatus.ParsedResults, "Parsed results should be set")
 		storedParsedResults := *scanStatus.ParsedResults
+		successfulFreshness := getSBOMLastSecurityScannedAt(t, ctx, testDigest)
+		require.NotNil(t, successfulFreshness["x86_64"])
+		assert.Equal(t, successfulScanCompletedAt, *successfulFreshness["x86_64"],
+			"Result metadata and successful freshness should publish with the same timestamp")
 
 		// A later status-only update must preserve the last successful counts.
 		err = externalimage.SetExternalImageScanStatus(ctx, externalimage.SetExternalImageScanStatusParams{
@@ -153,13 +158,50 @@ func TestExternalImageScanStatusTransitions(t *testing.T) {
 
 		scanStatuses = getScanStatuses(t, ctx, testDigest)
 		require.Len(t, scanStatuses, 1)
+		assert.Equal(t, "failed", scanStatuses[0].Status)
+		require.NotNil(t, scanStatuses[0].ScanCompletedAt)
+		assert.Equal(t, successfulScanCompletedAt, *scanStatuses[0].ScanCompletedAt,
+			"A failed refresh must preserve the last successful completion time")
 		require.NotNil(t, scanStatuses[0].ParsedResults)
 		assert.Equal(t, storedParsedResults, *scanStatuses[0].ParsedResults)
+
+		// A later success replaces the failed attempt state and advances freshness.
+		err = listener.RunScanForDigest(ctx, testDigest)
+		require.NoError(t, err)
+		scanStatuses = getScanStatuses(t, ctx, testDigest)
+		require.Len(t, scanStatuses, 1)
+		assert.Equal(t, "succeeded", scanStatuses[0].Status)
+		assert.Nil(t, scanStatuses[0].ScanStatusMessage)
+		require.NotNil(t, scanStatuses[0].ScanCompletedAt)
+		assert.True(t, scanStatuses[0].ScanCompletedAt.After(successfulScanCompletedAt),
+			"A recovered scan should advance the successful completion time")
 
 		// Verify SBOM status remains succeeded
 		sbomStatuses = getSBOMStatuses(t, ctx, testDigest)
 		require.Len(t, sbomStatuses, 1)
 		assert.Equal(t, "succeeded", sbomStatuses[0].Status)
+	})
+
+	t.Run("Successful metadata rolls back when freshness cannot be published", func(t *testing.T) {
+		missingSBOMDigest := "sha256:test-missing-sbom-1234567890123456789012345678901234"
+		err := externalimage.SetExternalImageScanStatus(ctx, externalimage.SetExternalImageScanStatusParams{
+			Digest:               missingSBOMDigest,
+			Arch:                 "x86_64",
+			Status:               externalimage.ScanStatusSucceeded,
+			ParsedResults:        `{"total":0}`,
+			ParsedResultsDetails: `{"counts":{"total":0}}`,
+			RawResult:            `{"matches":[]}`,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected 1 SBOM row")
+
+		conn := persistence.MustGetPooledPostgresSession(ctx)
+		defer conn.Release()
+		var count int
+		require.NoError(t, conn.QueryRow(ctx,
+			`SELECT COUNT(*) FROM external_image_scan WHERE digest = $1`,
+			missingSBOMDigest).Scan(&count))
+		assert.Zero(t, count, "scan metadata should roll back with the failed freshness update")
 	})
 }
 
@@ -308,13 +350,105 @@ func TestExternalImageScanFailure(t *testing.T) {
 		assert.Equal(t, "failed", scanStatus.Status)
 		assert.NotNil(t, scanStatus.ScanStatusMessage)
 		assert.Nil(t, scanStatus.ParsedResults, "A failed scan without prior results should store NULL counts")
-		assert.NotNil(t, scanStatus.ScanCompletedAt, "Completion timestamp should be set even on failure")
+		assert.Nil(t, scanStatus.ScanCompletedAt, "A first-attempt failure has no successful completion time")
 
 		// Verify SBOM status remains succeeded
 		sbomStatuses = getSBOMStatuses(t, ctx, testDigest)
 		require.Len(t, sbomStatuses, 1)
 		assert.Equal(t, "succeeded", sbomStatuses[0].Status)
 	})
+}
+
+// TestExternalImagePartialArchitectureFailure verifies that a refresh can
+// publish one architecture while retaining the previous usable result and
+// freshness for an architecture that failed.
+func TestExternalImagePartialArchitectureFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+	t.Parallel()
+
+	ctx := context.Background()
+	testDB := testutil.SetupTestDatabase(ctx, t)
+	defer testutil.TeardownTestDatabase(ctx, t, testDB)
+
+	projectRoot, err := testutil.FindProjectRoot()
+	require.NoError(t, err)
+	require.NoError(t, testutil.ApplySchemaHero(ctx, testDB.ConnStr,
+		filepath.Join(projectRoot, "db", "schema", "tables"), false))
+
+	ctx, minioStorage := setupMinIOOverrides(ctx, t, testDB.ConnStr)
+	defer testutil.TeardownMinIO(ctx, t, minioStorage)
+	require.NoError(t, persistence.InitPostgres(ctx))
+	defer persistence.ClosePool(ctx)
+
+	digest := "sha256:test-partial-refresh-12345678901234567890123456789012"
+	require.NoError(t, externalimage.AddExternalImage(ctx, "docker.io", "library/multiarch", "latest", digest, "", ""))
+	require.NoError(t, externalimage.InitializeSBOMStatusPending(ctx, digest))
+
+	mockFetchSBOM := func(context.Context, string, string, string) ([]sbom.SBOMResult, error) {
+		return []sbom.SBOMResult{
+			{Architecture: "linux/amd64", SBOM: `{"artifacts":[]}`, Source: "syft", ImageDigest: digest},
+			{Architecture: "linux/arm64", SBOM: `{"artifacts":[]}`, Source: "syft", ImageDigest: digest},
+		}, nil
+	}
+	allSuccessful := func(context.Context, string) (map[string]string, error) {
+		return map[string]string{
+			"x86_64":  `{"matches":[],"descriptor":{"name":"grype","version":"0.95.0"}}`,
+			"aarch64": `{"matches":[],"descriptor":{"name":"grype","version":"0.95.0"}}`,
+		}, nil
+	}
+
+	ctx = setupMocks(ctx, mockFetchSBOM, allSuccessful)
+	require.NoError(t, listener.HandleExternalImageSbom(ctx, listenertypes.ExternalImageSbomPayload{Digest: digest}))
+	require.NoError(t, listener.RunScanForDigest(ctx, digest))
+
+	initialRows := getScanStatuses(t, ctx, digest)
+	require.Len(t, initialRows, 2)
+	initialByArch := map[string]scanStatusRow{}
+	for _, row := range initialRows {
+		initialByArch[row.Arch] = row
+		require.Equal(t, "succeeded", row.Status)
+		require.NotNil(t, row.ScanCompletedAt)
+		require.NotNil(t, row.ParsedResults)
+	}
+	initialFreshness := getSBOMLastSecurityScannedAt(t, ctx, digest)
+	require.NotNil(t, initialFreshness["x86_64"])
+	require.NotNil(t, initialFreshness["aarch64"])
+
+	partialSuccess := func(context.Context, string) (map[string]string, error) {
+		return map[string]string{
+			"x86_64": `{"matches":[],"descriptor":{"name":"grype","version":"0.96.0"}}`,
+		}, nil
+	}
+	ctx = listener.WithMockScanExternalImage(ctx, partialSuccess)
+	require.NoError(t, listener.RunScanForDigest(ctx, digest))
+
+	refreshedRows := getScanStatuses(t, ctx, digest)
+	require.Len(t, refreshedRows, 2)
+	refreshedByArch := map[string]scanStatusRow{}
+	for _, row := range refreshedRows {
+		refreshedByArch[row.Arch] = row
+	}
+
+	failedArch := refreshedByArch["aarch64"]
+	assert.Equal(t, "failed", failedArch.Status)
+	require.NotNil(t, failedArch.ScanStatusMessage)
+	require.NotNil(t, failedArch.ScanCompletedAt)
+	assert.Equal(t, *initialByArch["aarch64"].ScanCompletedAt, *failedArch.ScanCompletedAt)
+	require.NotNil(t, failedArch.ParsedResults)
+	assert.Equal(t, *initialByArch["aarch64"].ParsedResults, *failedArch.ParsedResults)
+
+	successfulArch := refreshedByArch["x86_64"]
+	assert.Equal(t, "succeeded", successfulArch.Status)
+	require.NotNil(t, successfulArch.ScanCompletedAt)
+	assert.True(t, successfulArch.ScanCompletedAt.After(*initialByArch["x86_64"].ScanCompletedAt))
+
+	refreshedFreshness := getSBOMLastSecurityScannedAt(t, ctx, digest)
+	require.NotNil(t, refreshedFreshness["aarch64"])
+	assert.Equal(t, *initialFreshness["aarch64"], *refreshedFreshness["aarch64"])
+	require.NotNil(t, refreshedFreshness["x86_64"])
+	assert.True(t, refreshedFreshness["x86_64"].After(*initialFreshness["x86_64"]))
 }
 
 // TestExternalImageSBOMStatusTransitions tests SBOM status transitions independently
@@ -722,6 +856,31 @@ func getScanStatuses(t *testing.T, ctx context.Context, digest string) []scanSta
 	}
 
 	return statuses
+}
+
+func getSBOMLastSecurityScannedAt(t *testing.T, ctx context.Context, digest string) map[string]*time.Time {
+	t.Helper()
+
+	conn := persistence.MustGetPooledPostgresSession(ctx)
+	defer conn.Release()
+
+	rows, err := conn.Query(ctx, `
+		SELECT arch, last_security_scanned_at
+		FROM external_image_sbom
+		WHERE digest = $1
+	`, digest)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	result := map[string]*time.Time{}
+	for rows.Next() {
+		var arch string
+		var lastScannedAt *time.Time
+		require.NoError(t, rows.Scan(&arch, &lastScannedAt))
+		result[arch] = lastScannedAt
+	}
+	require.NoError(t, rows.Err())
+	return result
 }
 
 func getSBOMStatuses(t *testing.T, ctx context.Context, digest string) []sbomStatusRow {
