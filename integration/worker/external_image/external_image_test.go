@@ -1002,6 +1002,61 @@ func TestExternalImageScanGenerationPublication(t *testing.T) {
 		assert.Zero(t, remaining)
 	})
 
+	t.Run("cleanup deadline returns without panicking", func(t *testing.T) {
+		timeoutDigest := "sha256:cleanup-timeout-12345678901234567890123456789012345"
+		generations := []string{"cleanup-timeout-first", "cleanup-timeout-locked", "cleanup-timeout-last"}
+		conn := persistence.MustGetPooledPostgresSession(ctx)
+		_, err := conn.Exec(ctx, `
+			INSERT INTO external_image_scan_generation (
+				generation_id, digest, arch, state,
+				raw_object_key, raw_size_bytes, raw_sha256,
+				details_object_key, details_size_bytes, details_sha256,
+				created_at, cleanup_after
+			)
+			VALUES
+				($1, $4, $5, 'failed', 'timeout/first/raw', 1, 'raw', 'timeout/first/details', 1, 'details', NOW(), NOW() - INTERVAL '3 minutes'),
+				($2, $4, $5, 'failed', 'timeout/locked/raw', 1, 'raw', 'timeout/locked/details', 1, 'details', NOW(), NOW() - INTERVAL '2 minutes'),
+				($3, $4, $5, 'failed', 'timeout/last/raw', 1, 'raw', 'timeout/last/details', 1, 'details', NOW(), NOW() - INTERVAL '1 minute')
+		`, generations[0], generations[1], generations[2], timeoutDigest, arch)
+		conn.Release()
+		require.NoError(t, err)
+
+		lockConn := persistence.MustGetPooledPostgresSession(ctx)
+		lockTx, err := lockConn.Begin(ctx)
+		require.NoError(t, err)
+		_, err = lockTx.Exec(ctx, `
+			SELECT generation_id
+			FROM external_image_scan_generation
+			WHERE generation_id = $1 AND digest = $2 AND arch = $3
+			FOR UPDATE
+		`, generations[1], timeoutDigest, arch)
+		require.NoError(t, err)
+
+		cleanupCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		err = externalimage.CleanupExternalImageScanCandidates(cleanupCtx, 100)
+		cancel()
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.NoError(t, lockTx.Rollback(ctx))
+		lockConn.Release()
+
+		conn = persistence.MustGetPooledPostgresSession(ctx)
+		var lastState string
+		require.NoError(t, conn.QueryRow(ctx, `
+			SELECT state
+			FROM external_image_scan_generation
+			WHERE generation_id = $1 AND digest = $2 AND arch = $3
+		`, generations[2], timeoutDigest, arch).Scan(&lastState))
+		assert.Equal(t, "failed", lastState, "cleanup must stop when its deadline expires")
+		_, err = conn.Exec(ctx, `
+			UPDATE external_image_scan_generation
+			SET state = 'failed', cleanup_after = NOW() - INTERVAL '1 minute'
+			WHERE digest = $1 AND arch = $2
+		`, timeoutDigest, arch)
+		conn.Release()
+		require.NoError(t, err)
+		require.NoError(t, externalimage.CleanupExternalImageScanCandidates(ctx, 100))
+	})
+
 	firstDigest := "sha256:first-generation-publication-123456789012345678901234567"
 	conn = persistence.MustGetPooledPostgresSession(ctx)
 	_, err = conn.Exec(ctx, `
@@ -1019,6 +1074,75 @@ func TestExternalImageScanGenerationPublication(t *testing.T) {
 	assert.Empty(t, firstResult.raw)
 	assert.Empty(t, firstResult.details)
 	assert.False(t, firstResult.available)
+
+	t.Run("terminal failure releases expired candidate for cleanup", func(t *testing.T) {
+		terminalDigest := "sha256:terminal-failure-12345678901234567890123456789012345"
+		const terminalGeneration = "terminal-failure-generation"
+		conn := persistence.MustGetPooledPostgresSession(ctx)
+		_, err := conn.Exec(ctx, `
+			INSERT INTO external_image_sbom (digest, arch, source, created_at, is_in_object_store)
+			VALUES ($1, $2, 'syft', NOW(), false)
+		`, terminalDigest, arch)
+		conn.Release()
+		require.NoError(t, err)
+		require.NoError(t, externalimage.SetScanStatusRunning(ctx, terminalDigest, arch, terminalGeneration))
+
+		failedCtx := externalimage.WithScanPublicationFailure(ctx, externalimage.ScanPublicationFailureBetweenUploads)
+		require.Error(t, publish(failedCtx, terminalDigest, terminalGeneration, "TERMINAL", 3))
+		require.NoError(t, externalimage.SetExternalImageScanStatus(ctx, externalimage.SetExternalImageScanStatusParams{
+			Digest:            terminalDigest,
+			Arch:              arch,
+			ScanGenerationID:  terminalGeneration,
+			Status:            externalimage.ScanStatusFailed,
+			ScanStatusMessage: "terminal publication failure",
+		}))
+
+		rawKey := fmt.Sprintf(
+			"%s/%s/scan-generations/%s/raw_result.json.gz",
+			terminalDigest[len("sha256:"):],
+			arch,
+			terminalGeneration,
+		)
+		_, err = minioStorage.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String("image-scans"),
+			Key:    aws.String(rawKey),
+		})
+		require.NoError(t, err, "the partial candidate should contain its raw object before cleanup")
+
+		conn = persistence.MustGetPooledPostgresSession(ctx)
+		_, err = conn.Exec(ctx, `
+			UPDATE external_image_scan_generation
+			SET cleanup_after = NOW() - INTERVAL '1 minute'
+			WHERE generation_id = $1 AND digest = $2 AND arch = $3
+		`, terminalGeneration, terminalDigest, arch)
+		conn.Release()
+		require.NoError(t, err)
+		require.NoError(t, externalimage.CleanupExternalImageScanCandidates(ctx, 100))
+
+		conn = persistence.MustGetPooledPostgresSession(ctx)
+		var currentGeneration *string
+		var status string
+		require.NoError(t, conn.QueryRow(ctx, `
+			SELECT current_scan_generation_id, status
+			FROM external_image_scan
+			WHERE digest = $1 AND arch = $2
+		`, terminalDigest, arch).Scan(&currentGeneration, &status))
+		var remaining int
+		require.NoError(t, conn.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM external_image_scan_generation
+			WHERE generation_id = $1 AND digest = $2 AND arch = $3
+		`, terminalGeneration, terminalDigest, arch).Scan(&remaining))
+		conn.Release()
+		assert.Nil(t, currentGeneration)
+		assert.Equal(t, string(externalimage.ScanStatusFailed), status)
+		assert.Zero(t, remaining)
+		_, err = minioStorage.S3Client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String("image-scans"),
+			Key:    aws.String(rawKey),
+		})
+		assert.Error(t, err, "cleanup must delete the partial candidate object")
+	})
 
 	require.NoError(t, externalimage.SetScanStatusRunning(ctx, digest, arch, "generation-old"))
 	selectionFailureCtx := externalimage.WithScanPublicationFailure(ctx, externalimage.ScanPublicationFailureSelection)
@@ -1171,8 +1295,29 @@ func TestExternalImageScanGenerationPublication(t *testing.T) {
 		conn.Release()
 		require.NoError(t, err)
 
-		selectionFailureCtx := externalimage.WithScanPublicationFailure(ctx, externalimage.ScanPublicationFailureSelection)
-		require.Error(t, publish(selectionFailureCtx, retryDigest, retryGeneration, "RETRY", 6))
+		reached := make(chan struct{})
+		resume := make(chan struct{}, 1)
+		defer func() {
+			select {
+			case resume <- struct{}{}:
+			default:
+			}
+		}()
+		pausedCtx := externalimage.WithScanPublicationPause(
+			ctx,
+			externalimage.ScanPublicationFailureBeforeRawUpload,
+			reached,
+			resume,
+		)
+		publisherResult := make(chan error, 1)
+		go func() {
+			publisherResult <- publish(pausedCtx, retryDigest, retryGeneration, "RETRY", 6)
+		}()
+		select {
+		case <-reached:
+		case <-time.After(10 * time.Second):
+			require.FailNow(t, "timed out waiting for retry publication lease")
+		}
 
 		conn = persistence.MustGetPooledPostgresSession(ctx)
 		var state string
@@ -1183,19 +1328,9 @@ func TestExternalImageScanGenerationPublication(t *testing.T) {
 			WHERE generation_id = $1 AND digest = $2 AND arch = $3
 		`, retryGeneration, retryDigest, arch).Scan(&state, &cleanupExtended))
 		conn.Release()
-		assert.Equal(t, "validated", state)
-		assert.True(t, cleanupExtended, "validation must refresh the candidate cleanup deadline")
+		assert.Equal(t, "failed", state)
+		assert.True(t, cleanupExtended, "a retry must renew the candidate cleanup deadline before uploading")
 
-		// Simulate cleanup having listed the candidate from a stale deadline. The
-		// scan-row lock and current-generation check must keep its objects alive.
-		conn = persistence.MustGetPooledPostgresSession(ctx)
-		_, err = conn.Exec(ctx, `
-			UPDATE external_image_scan_generation
-			SET cleanup_after = NOW() - INTERVAL '1 minute'
-			WHERE generation_id = $1 AND digest = $2 AND arch = $3
-		`, retryGeneration, retryDigest, arch)
-		conn.Release()
-		require.NoError(t, err)
 		require.NoError(t, externalimage.CleanupExternalImageScanCandidates(ctx, 100))
 
 		conn = persistence.MustGetPooledPostgresSession(ctx)
@@ -1205,10 +1340,16 @@ func TestExternalImageScanGenerationPublication(t *testing.T) {
 			WHERE generation_id = $1 AND digest = $2 AND arch = $3
 		`, retryGeneration, retryDigest, arch).Scan(&state, &cleanupExtended))
 		conn.Release()
-		assert.Equal(t, "validated", state)
-		assert.True(t, cleanupExtended, "cleanup must defer deletion of the current generation")
+		assert.Equal(t, "failed", state)
+		assert.True(t, cleanupExtended, "cleanup must preserve a candidate with an active publication lease")
 
-		require.NoError(t, publish(ctx, retryDigest, retryGeneration, "RETRY", 6))
+		resume <- struct{}{}
+		select {
+		case err := <-publisherResult:
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			require.FailNow(t, "timed out waiting for retry publication")
+		}
 		retried := readSelected(retryDigest)
 		assert.Equal(t, retryGeneration, retried.generationID)
 		assertGenerationConsistent(retried, "RETRY", 6)

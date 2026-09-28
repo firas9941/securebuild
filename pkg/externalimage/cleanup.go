@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/securebuildhq/securebuild/pkg/logger"
 	"github.com/securebuildhq/securebuild/pkg/persistence"
 	"github.com/securebuildhq/securebuild/pkg/telemetry"
@@ -20,6 +21,7 @@ const (
 	scanCandidateCleanupRunBudget       = 45 * time.Second
 	scanCandidateCleanupLease           = 5 * time.Minute
 	scanCandidateCleanupBatchSize       = 500
+	scanCandidateCleanupAcquireTimeout  = 5 * time.Second
 )
 
 type scanCandidateIdentity struct {
@@ -39,6 +41,14 @@ type scanCandidateCleanupStats struct {
 	deleted   int64
 	protected int64
 	failed    int64
+}
+
+func acquireScanCandidateCleanupConnection(ctx context.Context) (*pgxpool.Conn, error) {
+	conn, err := persistence.GetPooledPostgresSessionWithTimeout(ctx, scanCandidateCleanupAcquireTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire database connection for scan candidate cleanup: %w", err)
+	}
+	return conn, nil
 }
 
 // StartScanCandidateCleanup continuously drains failed, abandoned, and
@@ -132,9 +142,15 @@ func cleanupExternalImageScanCandidateBatch(ctx context.Context, limit int) (sca
 
 	deletions := make([]scanCandidateDeletion, 0, len(candidates))
 	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		deletion, protected, err := claimExternalImageScanCandidateDeletion(ctx, candidate)
 		if err != nil {
 			stats.failed++
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return stats, err
+			}
 			logger.Warn("failed to claim external image scan candidate for cleanup",
 				zap.String("generation_id", candidate.generationID),
 				zap.String("digest", candidate.digest),
@@ -152,6 +168,9 @@ func cleanupExternalImageScanCandidateBatch(ctx context.Context, limit int) (sca
 	}
 	if len(deletions) == 0 {
 		return stats, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return stats, err
 	}
 
 	store, err := getScanObjectStore(ctx)
@@ -177,7 +196,10 @@ func cleanupExternalImageScanCandidateBatch(ctx context.Context, limit int) (sca
 }
 
 func listExpiredScanCandidates(ctx context.Context, limit int) ([]scanCandidateIdentity, error) {
-	conn := persistence.MustGetPooledPostgresSession(ctx)
+	conn, err := acquireScanCandidateCleanupConnection(ctx)
+	if err != nil {
+		return nil, err
+	}
 	defer conn.Release()
 
 	rows, err := conn.Query(ctx, `
@@ -209,7 +231,10 @@ func listExpiredScanCandidates(ctx context.Context, limit int) ([]scanCandidateI
 }
 
 func claimExternalImageScanCandidateDeletion(ctx context.Context, candidate scanCandidateIdentity) (*scanCandidateDeletion, bool, error) {
-	conn := persistence.MustGetPooledPostgresSession(ctx)
+	conn, err := acquireScanCandidateCleanupConnection(ctx)
+	if err != nil {
+		return nil, false, err
+	}
 	defer conn.Release()
 
 	tx, err := conn.Begin(ctx)
@@ -254,22 +279,29 @@ func claimExternalImageScanCandidateDeletion(ctx context.Context, candidate scan
 		}
 		return nil, true, tx.Commit(ctx)
 	}
-	if currentGeneration.Valid && currentGeneration.String == candidate.generationID {
-		_, err = tx.Exec(ctx, `
-			UPDATE external_image_scan_generation
-			SET cleanup_after = $4
-			WHERE generation_id = $1 AND digest = $2 AND arch = $3
-		`, candidate.generationID, candidate.digest, candidate.arch, time.Now().Add(scanCandidateCleanupDelay))
-		if err != nil {
-			return nil, false, err
-		}
-		return nil, true, tx.Commit(ctx)
-	}
 
 	now := time.Now()
-	if state == "deleting" && cleanupAfter.Valid && cleanupAfter.Time.After(now) {
-		return nil, false, tx.Commit(ctx)
+	// A publisher renews cleanup_after while holding the candidate row lock
+	// before it touches object storage. Recheck the deadline under that same
+	// lock so a candidate listed just before renewal cannot be deleted.
+	if !cleanupAfter.Valid || cleanupAfter.Time.After(now) {
+		return nil, true, tx.Commit(ctx)
 	}
+	if currentGeneration.Valid && currentGeneration.String == candidate.generationID {
+		result, err := tx.Exec(ctx, `
+			UPDATE external_image_scan
+			SET current_scan_generation_id = NULL
+			WHERE digest = $1 AND arch = $2
+			  AND current_scan_generation_id = $3
+		`, candidate.digest, candidate.arch, candidate.generationID)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to revoke expired scan candidate ownership: %w", err)
+		}
+		if result.RowsAffected() != 1 {
+			return nil, false, fmt.Errorf("failed to revoke expired scan candidate ownership: expected 1 scan row, updated %d", result.RowsAffected())
+		}
+	}
+
 	_, err = tx.Exec(ctx, `
 		UPDATE external_image_scan_generation
 		SET state = 'deleting', cleanup_after = $4
@@ -302,7 +334,10 @@ func deleteScanCandidateMetadata(ctx context.Context, candidates []scanCandidate
 		architectures[i] = candidate.arch
 	}
 
-	conn := persistence.MustGetPooledPostgresSession(ctx)
+	conn, err := acquireScanCandidateCleanupConnection(ctx)
+	if err != nil {
+		return 0, err
+	}
 	defer conn.Release()
 	result, err := conn.Exec(ctx, `
 		DELETE FROM external_image_scan_generation generation
@@ -336,12 +371,15 @@ func deleteScanCandidateMetadata(ctx context.Context, candidates []scanCandidate
 }
 
 func reportScanCandidateCleanupMetrics(ctx context.Context) error {
-	conn := persistence.MustGetPooledPostgresSession(ctx)
+	conn, err := acquireScanCandidateCleanupConnection(ctx)
+	if err != nil {
+		return err
+	}
 	defer conn.Release()
 
 	var pending, pendingBytes, overdue int64
 	var oldestOverdueSeconds float64
-	err := conn.QueryRow(ctx, `
+	err = conn.QueryRow(ctx, `
 		SELECT COUNT(*),
 		       COALESCE(SUM(raw_size_bytes + details_size_bytes), 0),
 		       COUNT(*) FILTER (WHERE cleanup_after <= NOW()),

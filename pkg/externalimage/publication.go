@@ -166,8 +166,14 @@ func ensureScanCandidate(ctx context.Context, candidate *scanCandidate) error {
 	conn := persistence.MustGetPooledPostgresSession(ctx)
 	defer conn.Release()
 
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin scan candidate transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
 	now := time.Now()
-	_, err := conn.Exec(ctx, `
+	_, err = tx.Exec(ctx, `
 		INSERT INTO external_image_scan_generation (
 			generation_id, digest, arch, state,
 			raw_object_key, raw_size_bytes, raw_sha256,
@@ -188,12 +194,13 @@ func ensureScanCandidate(ctx context.Context, candidate *scanCandidate) error {
 	stored.generationID = candidate.generationID
 	stored.digest = candidate.digest
 	stored.arch = candidate.arch
-	err = conn.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT state,
 		       raw_object_key, raw_size_bytes, raw_sha256,
 		       details_object_key, details_size_bytes, details_sha256
 		FROM external_image_scan_generation
 		WHERE generation_id = $1 AND digest = $2 AND arch = $3
+		FOR UPDATE
 	`, candidate.generationID, candidate.digest, candidate.arch).Scan(
 		&stored.state,
 		&stored.raw.key, &stored.raw.size, &stored.raw.sha256,
@@ -211,6 +218,19 @@ func ensureScanCandidate(ctx context.Context, candidate *scanCandidate) error {
 	if stored.raw.key != candidate.raw.key || stored.raw.size != candidate.raw.size || stored.raw.sha256 != candidate.raw.sha256 ||
 		stored.details.key != candidate.details.key || stored.details.size != candidate.details.size || stored.details.sha256 != candidate.details.sha256 {
 		return fmt.Errorf("%w: generation %s was reused with different object metadata", ErrInvalidScanCandidate, candidate.generationID)
+	}
+	if stored.state == "uploading" || stored.state == "failed" || stored.state == "validated" {
+		_, err = tx.Exec(ctx, `
+			UPDATE external_image_scan_generation
+			SET cleanup_after = $4
+			WHERE generation_id = $1 AND digest = $2 AND arch = $3
+		`, candidate.generationID, candidate.digest, candidate.arch, now.Add(scanCandidateCleanupDelay))
+		if err != nil {
+			return fmt.Errorf("failed to renew scan candidate publication lease: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit scan candidate transaction: %w", err)
 	}
 	candidate.state = stored.state
 	return nil
