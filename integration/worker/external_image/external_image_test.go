@@ -13,6 +13,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/securebuildhq/securebuild/integration/testutil"
 	"github.com/securebuildhq/securebuild/pkg/externalimage"
 	"github.com/securebuildhq/securebuild/pkg/listener"
@@ -20,6 +21,7 @@ import (
 	"github.com/securebuildhq/securebuild/pkg/param"
 	"github.com/securebuildhq/securebuild/pkg/persistence"
 	"github.com/securebuildhq/securebuild/pkg/sbom"
+	"github.com/securebuildhq/securebuild/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1055,6 +1057,27 @@ func TestExternalImageScanGenerationPublication(t *testing.T) {
 		conn.Release()
 		require.NoError(t, err)
 		require.NoError(t, externalimage.CleanupExternalImageScanCandidates(ctx, 100))
+	})
+
+	t.Run("dynamic R2 initialization returns cleanup deadline", func(t *testing.T) {
+		dynamicParams := *param.GetParam(ctx)
+		dynamicParams.R2UseDynamicFolder = true
+		dynamicCtx := context.WithValue(ctx, param.ParamContextKey, &dynamicParams)
+
+		connections := make([]*pgxpool.Conn, 0, 40)
+		for range 40 {
+			connections = append(connections, persistence.MustGetPooledPostgresSession(ctx))
+		}
+		defer func() {
+			for _, conn := range connections {
+				conn.Release()
+			}
+		}()
+
+		deadlineCtx, cancel := context.WithTimeout(dynamicCtx, 300*time.Millisecond)
+		defer cancel()
+		_, err := storage.NewR2Client(deadlineCtx, dynamicParams.R2ImageScansBucketName)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
 	})
 
 	firstDigest := "sha256:first-generation-publication-123456789012345678901234567"
