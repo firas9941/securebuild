@@ -262,7 +262,7 @@ func storeScanResults(ctx context.Context, digest, scanGenerationID string, scan
 			continue
 		}
 
-		countsJSON, marshalErr := json.Marshal(parsedResults.Counts)
+		countsJSON, marshalErr := image.MarshalScanResultSummary(parsedResults)
 		if marshalErr != nil {
 			recordScanFailure(ctx, digest, arch, scanGenerationID, externalimage.NewScanFailureError(externalimage.ErrMarshalScanCounts, fmt.Sprintf("failed to marshal scan counts: %s", marshalErr.Error())), false, attempt, maxAttempts)
 			continue
